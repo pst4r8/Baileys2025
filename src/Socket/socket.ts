@@ -40,6 +40,7 @@ import {
 	encodeBinaryNode,
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
+	isLidUser,
 	jidEncode,
 	S_WHATSAPP_NET
 } from '../WABinary'
@@ -85,6 +86,48 @@ export const makeSocket = (config: SocketConfig) => {
 
 	if (url.protocol === 'wss' && authState?.creds?.routingInfo) {
 		url.searchParams.append('ED', authState.creds.routingInfo.toString('base64url'))
+	}
+
+	/** ephemeral key pair used to encrypt/decrypt communication. Unique for each connection */
+	const ephemeralKeyPair = Curve.generateKeyPair()
+	/** WA noise protocol wrapper */
+	const noise = makeNoiseHandler({
+		keyPair: ephemeralKeyPair,
+		NOISE_HEADER: NOISE_WA_HEADER,
+		logger,
+		routingInfo: authState?.creds?.routingInfo
+	})
+
+	const ws = new WebSocketClient(url, config)
+
+	ws.connect()
+
+	const sendPromise = promisify(ws.send)
+	/** send a raw buffer */
+	const sendRawMessage = async (data: Uint8Array | Buffer) => {
+		if (!ws.isOpen) {
+			throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
+		}
+
+		const bytes = noise.encodeFrame(data)
+		await promiseTimeout<void>(connectTimeoutMs, async (resolve, reject) => {
+			try {
+				await sendPromise.call(ws, bytes)
+				resolve()
+			} catch (error) {
+				reject(error)
+			}
+		})
+	}
+
+	/** send a binary node */
+	const sendNode = (frame: BinaryNode) => {
+		if (logger.level === 'trace') {
+			logger.trace({ xml: binaryNodeToString(frame), msg: 'xml send' })
+		}
+
+		const buff = encodeBinaryNode(frame)
+		return sendRawMessage(buff)
 	}
 
 	/**
@@ -143,9 +186,9 @@ export const makeSocket = (config: SocketConfig) => {
 		const msgId = node.attrs.id
 
 		const result = await promiseTimeout<any>(timeoutMs, async (resolve, reject) => {
-			const result = await waitForMessage(msgId, timeoutMs).catch(reject)
+			const result = waitForMessage(msgId, timeoutMs).catch(reject)
 			sendNode(node)
-				.then(() => resolve(result))
+				.then(async () => resolve(await result))
 				.catch(reject)
 		})
 
@@ -214,36 +257,33 @@ export const makeSocket = (config: SocketConfig) => {
 	}
 
 	const onWhatsApp = async (...jids: string[]) => {
-		const usyncQuery = new USyncQuery().withContactProtocol().withLIDProtocol()
+		const usyncQuery = new USyncQuery().withLIDProtocol().withContactProtocol()
 
 		for (const jid of jids) {
-			const phone = `+${jid.replace('+', '').split('@')[0]?.split(':')[0]}`
-			usyncQuery.withUser(new USyncUser().withPhone(phone))
+			if (isLidUser(jid)) {
+				usyncQuery.withUser(new USyncUser().withId(jid)) // intentional
+			} else {
+				const phone = `+${jid.replace('+', '').split('@')[0]?.split(':')[0]}`
+				usyncQuery.withUser(new USyncUser().withPhone(phone))
+			}
 		}
 
 		const results = await executeUSyncQuery(usyncQuery)
 
 		if (results) {
+			if (results.list.filter(a => a.lid).length > 0) {
+				const lidMapping = signalRepository.getLIDMappingStore()
+				const lidOnly = results.list.filter(a => a.lid)
+				await lidMapping.storeLIDPNMappings(lidOnly.map(a => ({ pn: a.id, lid: a.lid as string })))
+			}
+
 			return results.list
 				.filter(a => !!a.contact)
 				.map(({ contact, id, lid }) => ({ jid: id, exists: contact as boolean, lid: lid as string }))
 		}
 	}
 
-	const ws = new WebSocketClient(url, config)
-
-	ws.connect()
-
 	const ev = makeEventBuffer(logger)
-	/** ephemeral key pair used to encrypt/decrypt communication. Unique for each connection */
-	const ephemeralKeyPair = Curve.generateKeyPair()
-	/** WA noise protocol wrapper */
-	const noise = makeNoiseHandler({
-		keyPair: ephemeralKeyPair,
-		NOISE_HEADER: NOISE_WA_HEADER,
-		logger,
-		routingInfo: authState?.creds?.routingInfo
-	})
 
 	const { creds } = authState
 	// add transaction capability
@@ -255,34 +295,6 @@ export const makeSocket = (config: SocketConfig) => {
 	let keepAliveReq: NodeJS.Timeout
 	let qrTimer: NodeJS.Timeout
 	let closed = false
-
-	const sendPromise = promisify(ws.send)
-	/** send a raw buffer */
-	const sendRawMessage = async (data: Uint8Array | Buffer) => {
-		if (!ws.isOpen) {
-			throw new Boom('Connection Closed', { statusCode: DisconnectReason.connectionClosed })
-		}
-
-		const bytes = noise.encodeFrame(data)
-		await promiseTimeout<void>(connectTimeoutMs, async (resolve, reject) => {
-			try {
-				await sendPromise.call(ws, bytes)
-				resolve()
-			} catch (error) {
-				reject(error)
-			}
-		})
-	}
-
-	/** send a binary node */
-	const sendNode = (frame: BinaryNode) => {
-		if (logger.level === 'trace') {
-			logger.trace({ xml: binaryNodeToString(frame), msg: 'xml send' })
-		}
-
-		const buff = encodeBinaryNode(frame)
-		return sendRawMessage(buff)
-	}
 
 	/** log & process any unexpected errors */
 	const onUnexpectedError = (err: Error | Boom, msg: string) => {
