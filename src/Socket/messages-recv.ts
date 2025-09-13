@@ -1120,7 +1120,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		if (getBinaryNodeChild(node, 'unavailable') && !encNode) {
 			await sendMessageAck(node)
 			const { key } = decodeMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '').fullMessage
-			response = await requestPlaceholderResend(key)
+			response = await requestPlaceholderResend(key) // TODO: DEPRECATE THIS LOGIC AND PASS IT OFF TO THE RETRY MANAGER
 			if (response === 'RESOLVED') {
 				return
 			}
@@ -1159,11 +1159,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			const altServer = jidDecode(alt)?.server
 			const lidMapping = signalRepository.getLIDMappingStore()
 			if (altServer === 'lid') {
-				if (typeof await lidMapping.getPNForLID(alt) == "string") {
+				if (typeof (await lidMapping.getPNForLID(alt)) === 'string') {
 					await lidMapping.storeLIDPNMapping(alt, msg.key.participant || msg.key.remoteJid!)
 				}
 			} else {
-				if (typeof await lidMapping.getLIDForPN(alt) == "string") {
+				if (typeof (await lidMapping.getLIDForPN(alt)) === 'string') {
 					await lidMapping.storeLIDPNMapping(msg.key.participant || msg.key.remoteJid!, alt)
 				}
 			}
